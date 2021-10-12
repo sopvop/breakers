@@ -11,10 +11,10 @@ data CircuitStatus
   = CircuitWorking
   | CircuitBroken
   | CircuitProbing
-  deriving (Show)
+  deriving stock (Show)
 
 -- | Exception thrown when circuit breaker is in broken state.
 data BrokenCircuit = BrokenCircuit
-  deriving (Show)
+  deriving stock (Show)
 
 instance Exception BrokenCircuit

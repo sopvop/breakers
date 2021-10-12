@@ -1,4 +1,3 @@
-{-# LANGUAGE LambdaCase #-}
 -- | A circuit breaker which works by regularly polling provided action.
 --
 -- 'PollingBreaker' starts in "working" state. If action run with
