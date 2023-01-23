@@ -25,27 +25,38 @@ import           Control.Concurrent.AlarmClock
 import           Control.Concurrent.MVar
 import           Control.Concurrent.STM
 import           Control.Exception
-import           Control.Monad (join)
+import           Control.Monad
 import           System.Clock (Clock (Monotonic), TimeSpec (..), getTime)
 
 import           Control.Concurrent.CircuitBreaker.Core
 
 -- | A circuit breaker which probes resource.
 data ProbingBreaker = ProbingBreaker
-  { cbTimeout   :: TimeSpec
-  , cbStatus    :: TVar CircuitStatus
-  , cbProbeLock :: MVar ()
-  , cbAlarm     :: AlarmClock MonotonicTime
+  { cbTimeout      :: TimeSpec
+  , cbMaxErrors    :: Int
+  , cbErrorTimeout :: TimeSpec
+  , cbStatus       :: TVar CircuitStatus
+  , cbErrorState   :: TVar ErrorsState
+  , cbProbeLock    :: MVar ()
+  , cbAlarm        :: AlarmClock MonotonicTime
+  }
+
+data ErrorsState = ErrorsState
+  { errorCount :: Int
+  , errorTime  :: TimeSpec
   }
 
 -- | Creates new 'ProbingBreaker'.
 newProbingBreaker
   :: TimeSpec -- ^ Time before probe attempt
+  -> Int -- ^ How many consecutive errors should happen before circuit is broken
+  -> TimeSpec -- ^ Time between errors before error count resets
   -> IO ProbingBreaker
-newProbingBreaker ts = do
+newProbingBreaker ts errc timeout = do
   tv <- newTVarIO CircuitWorking
-  ProbingBreaker ts tv
-    <$> newMVar ()
+  ProbingBreaker ts errc timeout tv
+    <$> newTVarIO (ErrorsState 0 (TimeSpec 0 0))
+    <*> newMVar ()
     <*> newAlarmClock (const $ reset tv)
 
 -- | Destroys 'ProbingBreaker', freeing used resources.
@@ -58,10 +69,12 @@ destroyProbingBreaker ProbingBreaker{..} =
 -- | Runs action with new 'ProbingBreaker' and destroys it afterwards.
 withProbingBreaker
   :: TimeSpec
+  -> Int
+  -> TimeSpec
   -> (ProbingBreaker -> IO a)
   -> IO a
-withProbingBreaker ts =
-  bracket (newProbingBreaker ts) destroyProbingBreaker
+withProbingBreaker ts tc ms =
+  bracket (newProbingBreaker ts tc ms) destroyProbingBreaker
 
 -- | Monitor breaker status with STM
 getStatusSTM :: ProbingBreaker -> STM CircuitStatus
@@ -82,17 +95,28 @@ reset st = atomically $ do
 
 withBreaker'
   :: ProbingBreaker
-  -> (TVar CircuitStatus -> MVar () -> IO (Maybe a))
+  -> (MVar () -> IO (Maybe a))
   -> IO a
   -> IO a
 withBreaker' ProbingBreaker{..} probe act = do
   s <- readTVarIO cbStatus -- fast path
   case s of
     CircuitBroken  -> throwIO BrokenCircuit
-    CircuitWorking -> onException act markBroken
-    CircuitProbing -> throwBad $ onException (probe cbStatus cbProbeLock) markBroken
+    CircuitWorking -> onException act markBroken >>= \r -> r <$ resetErrors
+    CircuitProbing -> do
+      r <- try $ probe cbProbeLock
+      case r of
+        Left e -> markBroken *> throwIO (e :: SomeException)
+        Right res -> case res of
+          Nothing -> throwIO BrokenCircuit
+          Just v -> v <$ markWorking
   where
-    throwBad f = f >>= maybe (throwIO BrokenCircuit) pure
+    resetErrors =
+      atomically . writeTVar cbErrorState $ ErrorsState 0 (TimeSpec 0 0)
+
+    markWorking = atomically $ do
+      writeTVar cbStatus CircuitWorking
+      writeTVar cbErrorState (ErrorsState 0 $ TimeSpec 0 0)
 
     markBroken = do
       t <- getTime Monotonic
@@ -100,10 +124,18 @@ withBreaker' ProbingBreaker{..} probe act = do
         st <- readTVar cbStatus
         case st of
           CircuitBroken -> pure ()
-          _ -> do
+          CircuitWorking -> do
+            ErrorsState {..} <- readTVar cbErrorState
+            let
+              errTimedOut = t - errorTime > cbErrorTimeout
+              numErrors = if errTimedOut then 0 else errorCount
+            writeTVar cbErrorState $ ErrorsState (succ numErrors) t
+            when (numErrors > cbMaxErrors) $ do
+              writeTVar cbStatus CircuitBroken
+              setAlarmSTM cbAlarm (MonotonicTime $ t + cbTimeout)
+          CircuitProbing -> do
             writeTVar cbStatus CircuitBroken
             setAlarmSTM cbAlarm (MonotonicTime $ t + cbTimeout)
-
 
 -- | Runs action checking circuit breaker status. If action throws any exception
 -- then it is considered failure and circuit to be broken.
@@ -118,16 +150,12 @@ withBreaker' ProbingBreaker{..} probe act = do
 withBreaker :: ProbingBreaker -> IO a -> IO a
 withBreaker pb act = withBreaker' pb probe act
   where
-    probe cbStatus cbProbeLock = mask $ \restore -> do
+    probe cbProbeLock = mask $ \restore -> do
       mb <- tryTakeMVar cbProbeLock
       case mb of
         Nothing -> pure Nothing -- we only allow one thread to make a probe, other are dropped
         Just _ ->
-          finally
-            (restore (Just <$> act)
-             <* atomically (writeTVar cbStatus CircuitWorking))
-            -- even if this interrupts, it does not break anything
-            $ putMVar cbProbeLock ()
+          finally (restore (Just <$> act)) $ putMVar cbProbeLock ()
 
 -- | A 'withBreaker' variant which returns 'Nothing' instead of throwing.
 tryWithBreaker
@@ -143,15 +171,14 @@ tryWithBreaker b act =
 withBreakerWaiting :: ProbingBreaker -> IO a -> IO a
 withBreakerWaiting pb act = withBreaker' pb probe act
   where
-    probe cbStatus cbProbeLock = mask $ \restore -> do
+    probe cbProbeLock = mask $ \restore -> do
       join $ withMVar cbProbeLock $ \_ -> do
-        s <- readTVarIO cbStatus -- re-check status now that we have lock
+        s <- readTVarIO $ cbStatus pb -- re-check status now that we have lock
         case s of
           CircuitBroken  -> pure (pure Nothing) -- other thread probed
           CircuitWorking -> pure (Just <$> act) -- run action without lock
           CircuitProbing -> -- we are the probing thread
-            (pure . Just <$> restore act)
-            <* atomically (writeTVar cbStatus CircuitWorking)
+            pure . Just <$> restore act
 
 -- | A variant of 'withBreakerWaiting' which returns 'Nothing' instead of
 -- throwing.

@@ -3,7 +3,7 @@ cabal-version:       2.2
 --   For further documentation, see http://haskell.org/cabal/users-guide/
 
 name:                breakers
-version:             0.1.0.1
+version:             0.2.0.0
 synopsis:            Circuit breaker pattern
 description: Circuit breaker pattern is used to detect failures and avoid
   repeating erroneous requests until failure is fixed.
@@ -56,3 +56,4 @@ library
   default-extensions:  DerivingStrategies
                      , LambdaCase
                      , RecordWildCards
+
